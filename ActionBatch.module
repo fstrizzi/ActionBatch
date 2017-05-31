@@ -1,0 +1,686 @@
+<?php
+require_once 'vendor/autoload.php';
+use Recombee\RecommApi\Client;
+use Recombee\RecommApi\Requests as Reqs;
+use Recombee\RecommApi\Exceptions as Ex;
+
+class ActionBatch extends WireData implements Module {
+
+    public static function getModuleInfo()
+    {
+        return array(
+            'title' => __('ActionBatch'),
+            'summary' => __('Guarda las acciones del usuario para ejecutarlas mas tarde.'),
+            'author' => 'NSQE',
+            'version' => '0.0.1',
+            'autoload' => true
+        );
+    }
+
+    public function init() {
+        $this->addHookProperty("User::actions", $this, 'hookGetUserActions');
+        $this->addHookProperty("User::action", $this, 'hookGetUserActions');
+        $this->pages->addHookAfter('Pages::saved', $this, 'saveUserSession');
+    }
+
+    const table = 'users_action';
+
+    public function hookGetUserActions(HookEvent $event) {
+        $user = $event->object;
+        $base = ActionElement::allActionsByUser($user);
+        $event->return = $base;
+        return;
+    }
+
+    public function ___install() {
+        $table = self::table;
+        $this->database->exec("CREATE TABLE IF NOT EXISTS `$table` (
+          `id` int(11) NOT NULL AUTO_INCREMENT,
+          `user_id` int(11) NOT NULL,
+          `status` varchar(255) NOT NULL,
+          `submitted` int(11) unsigned NULL,
+          `ended` int(11) unsigned NULL,
+          `command` varchar(255) NOT NULL,
+          `created` int(11) unsigned NOT NULL,
+          `response` mediumtext NULL,
+          PRIMARY KEY (`id`),
+          KEY `user_id` (`user_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8 ;");
+    }
+
+    public function ___uninstall() {
+        $table = self::table;
+        $this->database->exec("DROP TABLE `$table`;");
+    }
+
+    public function saveUserSession($event) {
+        $page = $event->arguments[0];
+        if($page->template == "user" && !$page->isTrash() && !$page->isChanged() ){
+            $user = $page;
+            $user_actions = wire('session')->get("user_actions");
+            if ($user_actions=='') {
+                return;
+            }
+            $actionsArray = json_decode($user_actions, true);
+            if (count($actionsArray)>0) {
+                foreach ($actionsArray as $action) {
+                    $rAction = new ActionElement();
+                    $rAction->user = $user;
+                    $rAction->action = $action['action'];
+                    $rAction->value = $action['value'];
+                    $rAction->save();
+                }
+                wire('session')->remove("user_actions");
+            }
+        }
+    }
+
+}
+
+class ActionElement {
+    protected $user, $status = 'new', $action, $value, $submitted=null, $ended=null, $command, $created, $response=null,$id, $exists = true;
+    protected static $instances = array();
+
+    public function __get($i) {
+        return $this->$i;
+    }
+
+    public function __construct($ar = array()) {
+        $this->user = wire('user');
+        foreach ($ar as $k => $v) $this->$k = $v;
+        
+
+        self::$instances["{$this->id}"] = $this;
+    }
+
+    public function __set($i, $x) {
+        switch ($i) {
+            case 'action':
+                $x = $x;
+                break;
+            case 'value':
+                $x = $x;
+                break;
+            case 'command':
+                $x = $x;
+                break;
+            case 'user':
+                $x = $x;
+                break;
+            default:
+                return;
+        }
+
+        $this->$i = $x;
+    }
+    public static function getActionByID($id) {
+        if (isset(self::$instances["{$id}"])) return self::$instances["{$id}"];
+
+        $instance = new self(array('id' => $id));
+        $instance->fetch();
+        return $instance;
+    }
+
+    public static function allActionsByUser(User $user, $includeAll = null) {
+        $table = ActionBatch::table;
+        if ($user == null) {
+            return;
+        }
+        $actions = array();
+        $q = "SELECT id FROM $table WHERE user_id = ? AND status = 'new'";
+        if ($includeAll) {
+            $q = "SELECT id FROM $table WHERE user_id = ?";
+        }
+
+        $statement = wire('database')->prepare($q);
+        if (!$statement->execute(array($user->id))) return array();
+
+        while (($set = $statement->fetch(PDO::FETCH_ASSOC)) !== false) {
+            $actions[] = $set['id'];
+        }
+
+        $re = array();
+        foreach ($actions as $c) $re[] = self::getActionByID((int)$c);
+
+        return $re;
+    }
+
+    public static function process() {
+        $user = wire('user');
+        if ($user == wire('users')->getGuestUser()) {
+            return;
+        }
+        $actions = self::allActionsByUser($user);
+        
+        if (count($actions)==0) {
+            return false;
+        }
+        $requests = array();
+        $carrerasReturn = array();
+        $fechaO = new DateTime();
+        $timestampO = $fechaO->getTimestamp();
+        $returnCarreras = false;
+        foreach ($actions as $key => $action) {
+            $re = new self(array(
+                'id' => $action->id,
+                'command' => $action->command,
+                'status' => 'running',
+                'submitted' => $timestampO,
+                'created' => $action->created
+                ));
+            if ( $re->save() ) {
+                $c = json_decode($action->command);
+                if (!is_object($c)) {
+                    return;
+                }
+                if ( property_exists($c, 'AddRating') ) {
+                    $v = $c->AddRating;
+                    $r = new Reqs\AddRating( $v[0], $v[1], $v[2], ['timestamp' => $action->created,'cascadeCreate' => true] );
+                    $r->setTimeout(5000);
+                }
+                if ( property_exists($c, 'DeleteRating') ) {
+                    $v = $c->DeleteRating;
+                    $r = new Reqs\DeleteRating( $v[0], $v[1] );
+                    $r->setTimeout(5000);
+                }
+                if ( property_exists($c, 'ListItemRatings') ) {
+                    $v = $c->ListItemRatings;
+                    $r = new Reqs\ListItemRatings( $v[0] );
+                    $r->setTimeout(5000);
+                }
+                if ( property_exists($c, 'AddDetailView') ) {
+                    $v = $c->AddDetailView;
+                    $r = new Reqs\AddDetailView( $v[0], $v[1], ['timestamp' => $action->created,'duration' => $v[2],'cascadeCreate' => true] );
+                    $r->setTimeout(5000);
+                }
+                if ( property_exists($c, 'DeleteDetailView') ) {
+                    $v = $c->DeleteDetailView;
+                    $r = new Reqs\DeleteDetailView( $v[0], $v[1], ['timestamp' => $action->created] );
+                    $r->setTimeout(5000);
+                }
+                if ( property_exists($c, 'ListItemDetailViews') ) {
+                    $v = $c->ListItemDetailViews;
+                    $r = new Reqs\ListItemDetailViews( $v[0] );
+                    $r->setTimeout(5000);
+                }
+                if ( property_exists($c, 'ListUserDetailViews') ) {
+                    $v = $c->ListUserDetailViews;
+                    $r = new Reqs\ListUserDetailViews( $v[0] );
+                    $r->setTimeout(5000);
+                }
+                if ( property_exists($c, 'AddBookmark') ) {
+                    $v = $c->AddBookmark;
+                    $r = new Reqs\AddBookmark( $v[0], $v[1], ['timestamp' => $action->created,'cascadeCreate' => true] );
+                    $r->setTimeout(5000);
+                }
+                if ( property_exists($c, 'DeleteBookmark') ) {
+                    $v = $c->DeleteBookmark;
+                    $r = new Reqs\DeleteBookmark( $v[0], $v[1] );
+                    $r->setTimeout(5000);
+                }
+                if ( property_exists($c, 'ListItemBookmarks') ) {
+                    $v = $c->ListItemBookmarks;
+                    $r = new Reqs\ListItemBookmarks( $v[0] );
+                    $r->setTimeout(5000);
+                }
+                if ( property_exists($c, 'ListUserBookmarks') ) {
+                    $v = $c->ListUserBookmarks;
+                    $r = new Reqs\ListUserBookmarks( $v[0] );
+                    $r->setTimeout(5000);
+                }
+                if ( property_exists($c, 'AddPurchase') ) {
+                    $v = $c->AddPurchase;
+                    $r = new Reqs\AddPurchase( $v[0], $v[1], ['timestamp' => $action->created,'cascadeCreate' => true] );
+                    $r->setTimeout(5000);
+                }
+                if ( property_exists($c, 'DeletePurchase') ) {
+                    $v = $c->DeletePurchase;
+                    $r = new Reqs\DeletePurchase( $v[0], $v[1], ['timestamp' => $action->create] );
+                    $r->setTimeout(5000);
+                }
+                if ( property_exists($c, 'ListItemPurchases') ) {
+                    $v = $c->ListItemPurchases;
+                    $r = new Reqs\ListItemPurchases( $v[0] );
+                    $r->setTimeout(5000);
+                }
+                if ( property_exists($c, 'ListUserPurchases') ) {
+                    $v = $c->ListUserPurchases;
+                    $r = new Reqs\ListUserPurchases( $v[0] );
+                    $r->setTimeout(5000);
+                }
+                if ( property_exists($c, 'AddCartAddition') ) {
+                    $v = $c->AddCartAddition;
+                    $r = new Reqs\AddCartAddition( $v[0], $v[1], ['timestamp' => $action->created,'cascadeCreate' => true] );
+                    $r->setTimeout(5000);
+                }
+                if ( property_exists($c, 'DeleteCartAddition') ) {
+                    $v = $c->DeleteCartAddition;
+                    $r = new Reqs\DeleteCartAddition( $v[0], $v[1] );
+                    $r->setTimeout(5000);
+                }
+                if ( property_exists($c, 'ListItemCartAdditions') ) {
+                    $v = $c->ListItemCartAdditions;
+                    $r = new Reqs\ListItemCartAdditions( $v[0] );
+                    $r->setTimeout(5000);
+                }
+                if ( property_exists($c, 'ListUserCartAdditions') ) {
+                    $v = $c->ListUserCartAdditions;
+                    $r = new Reqs\ListUserCartAdditions( $v[0] );
+                    $r->setTimeout(5000);
+                }
+                if ( property_exists($c, 'ItemBasedRecommendation') ) {
+                    $v = $c->ItemBasedRecommendation;
+                    $r = new Reqs\ItemBasedRecommendation( $v[0], $v[1] );
+                    $r->setTimeout(5000);
+                    $returnCarreras = true;
+                }
+                if ( property_exists($c, 'UserBasedRecommendation') ) {
+                    $v = $c->UserBasedRecommendation;
+                    $r = new Reqs\UserBasedRecommendation( $v[0], $v[1] );
+                    $r->setTimeout(5000);
+                    $returnCarreras = true;
+                }
+
+                array_push($requests, $r);
+                if (isset($returnCarreras) && $returnCarreras == true ) {
+                    array_push($carrerasReturn, $key);
+                }
+            }
+        }
+
+        $client = new Client('*******', '************************');
+
+        try {
+            $results =  $client->send(new Reqs\Batch($requests));
+            foreach ($results as $index => $result) {
+                $fecha = new DateTime();
+                $timestamp = $fecha->getTimestamp();
+                $newA = new self(array(
+                    'id' => $actions[$index]->id,
+                    'status' => 'done',
+                    'ended' => $timestamp,
+                    'command' => $actions[$index]->command,
+                    'response' => json_encode($result),
+                    'submitted' => $timestampO,
+                ));
+                $newA->save();
+            }
+            if ( count($carrerasReturn) > 0 ) {
+                $test = array();
+                foreach ($carrerasReturn as $key) {
+                    $test[] = $results[$key]["json"];
+                }
+                return $test;
+            }
+            return true;
+        } 
+        catch(Exc\ResponseException $e) {
+            $log = new FileLog($config->paths->logs . 'recom.txt'); 
+            $log->save($e); 
+            return false;
+        }
+        
+    }
+
+    public function exists() {
+
+        return $this->exists;
+    }
+
+    public function delete() {
+
+        $table = ActionBatch::table;
+
+        if (!empty($this->id)) {
+            $statement = wire('database')->prepare("DELETE FROM $table WHERE id");
+            $this->exists = false;
+            return $statement->execute(array($id));
+        }
+
+        return true;
+    }
+
+    public function save() {
+        $fecha = new DateTime();
+        $timestamp = $fecha->getTimestamp();
+        if ( $this->user == wire('users')->getGuestUser() ) {
+            $user_actions = wire('session')->get("user_actions");
+            $actionsArray = json_decode($user_actions);
+            if (count($actionsArray>0)) {
+                $actionsArray[] = array('value' => $this->value, 'action' => $this->action, 'timestamp' => $timestamp );
+            } else {
+                $actionsArray = array('value' => $this->value, 'action' => $this->action, 'timestamp' => $timestamp);
+            }
+            wire('session')->set( "user_actions", json_encode($actionsArray) );
+            $this->exists = true;
+            return true;
+        }
+
+        if ( !$this->command ) {
+            if ( !$this->action ) {
+                $this->exists = false;
+                return;
+            }
+        }
+
+        if (!$this->user) {
+            return;
+        }
+
+        if (!$this->command) {
+            $userId = $this->user->id;
+            switch ($this->action) {
+                //Rating    
+                case 'AddRating':
+                    if ( is_array($this->value) ) {
+                        $rating = $this->value['rating'];
+                        $itemId = $this->value['itemId'];
+                    } else {
+                        break;
+                    }
+                    $r['AddRating'] = array(
+                        "{$userId}",
+                        "carrera-{$itemId}",
+                        $rating
+                    );
+                    $command = json_encode($r);
+                    break;
+                case 'DeleteRating':
+                    if ( is_array($this->value) ) {
+                        $itemId = $this->value['itemId'];
+                    } else {
+                        break;
+                    }
+                    $r['DeleteRating'] = array(
+                        "{$userId}",
+                        "carrera-{$itemId}"
+                    );
+                    $command = json_encode($r);
+                    break;
+                case 'ListItemRatings':
+                    if ( is_array($this->value) ) {
+                        $itemId = $this->value['itemId'];
+                    } else {
+                        break;
+                    }
+                    $r['ListItemRatings'] = array(
+                        "carrera-{$itemId}"
+                    );
+                    $command = json_encode($r);
+                    break;
+                case 'ListUserRatings':
+                    $r['ListUserRatings'] = array(
+                        "{$userId}"
+                    );
+                    $command = json_encode($r);
+                    break;
+                //End Rating
+                //Recommendations
+                case 'ItemBasedRecommendation':
+                    if ( is_array($this->value) ) {
+                        $itemId = $this->value['itemId'];
+                        $number = $this->value['number'];
+                    } else {
+                        break;
+                    }
+                    $r['ItemBasedRecommendation'] = array(
+                        "carrera-{$itemId}",
+                        $number
+                    );
+                    $command = json_encode($r);
+                    break;
+                case 'UserBasedRecommendation':
+                    if ( is_array($this->value) ) {
+                        $number = $this->value['number'];
+                    } else {
+                        break;
+                    }
+                    $r['UserBasedRecommendation'] = array(
+                        "{$userId}",
+                        $number
+                    );
+                    $command = json_encode($r);
+                    break;
+                //End Recommendations
+                //DetailView
+                case 'AddDetailView':
+                    if ( is_array($this->value) ) {
+                        if (isset( $this->value['duration'] )) {
+                            $duration = $this->value['duration'];
+                        } else {
+                            $duration = null;
+                        }
+                        $itemId = $this->value['itemId'];
+                    } else {
+                        break;
+                    }
+                    $r['AddDetailView'] = array(
+                        "{$userId}",
+                        "carrera-{$itemId}",
+                        $duration
+                    );
+                    $command = json_encode($r);
+                    break;
+                case 'DeleteDetailView':
+                    if ( is_array($this->value) ) {
+                        $itemId = $this->value['itemId'];
+                    } else {
+                        break;
+                    }
+                    $r['DeleteDetailView'] = array(
+                        "{$userId}",
+                        "carrera-{$itemId}"
+                    );
+                    $command = json_encode($r);
+                    break;
+                case 'ListItemDetailViews':
+                    if ( is_array($this->value) ) {
+                        $itemId = $this->value['itemId'];
+                    } else {
+                        break;
+                    }
+                    $r['ListItemDetailViews'] = array(
+                        "carrera-{$itemId}"
+                    );
+                    $command = json_encode($r);
+                    break;
+                case 'ListUserDetailViews':
+                    $r['ListUserDetailViews'] = array(
+                        "{$userId}"
+                    );
+                    $command = json_encode($r);
+                    break;
+                //End DetailView
+                //Bookmarks
+                case 'AddBookmark':
+                    if ( is_array($this->value) ) {
+                        $itemId = $this->value['itemId'];
+                    } else {
+                        break;
+                    }
+                    $r['AddBookmark'] = array(
+                        "{$userId}",
+                        "carrera-{$itemId}"
+                    );
+                    $command = json_encode($r);
+                    break;
+                case 'DeleteBookmark':
+                    if ( is_array($this->value) ) {
+                        $itemId = $this->value['itemId'];
+                    } else {
+                        break;
+                    }
+                    $r['DeleteBookmark'] = array(
+                        "{$userId}",
+                        "carrera-{$itemId}"
+                    );
+                    $command = json_encode($r);
+                    break;
+                case 'ListItemBookmarks':
+                    if ( is_array($this->value) ) {
+                        $itemId = $this->value['itemId'];
+                    } else {
+                        break;
+                    }
+                    $r['ListItemBookmarks'] = array(
+                        "carrera-{$itemId}"
+                    );
+                    $command = json_encode($r);
+                    break;
+                case 'ListUserBookmarks':
+                    $r['ListUserBookmarks'] = array(
+                        "{$userId}"
+                    );
+                    $command = json_encode($r);
+                    break;
+                //End Bookmark
+                //Purchases
+                case 'AddPurchase':
+                    if ( is_array($this->value) ) {
+                        $itemId = $this->value['itemId'];
+                    } else {
+                        break;
+                    }
+                    $r['AddPurchase'] = array(
+                        "{$userId}",
+                        "carrera-{$itemId}"
+                    );
+                    $command = json_encode($r);
+                    break;
+                case 'DeletePurchase':
+                    if ( is_array($this->value) ) {
+                        $itemId = $this->value['itemId'];
+                    } else {
+                        break;
+                    }
+                    $r['DeletePurchase'] = array(
+                        "{$userId}",
+                        "carrera-{$itemId}"
+                    );
+                    $command = json_encode($r);
+                    break;
+                case 'ListItemPurchases':
+                    if ( is_array($this->value) ) {
+                        $itemId = $this->value['itemId'];
+                    } else {
+                        break;
+                    }
+                    $r['ListItemPurchases'] = array(
+                        "carrera-{$itemId}"
+                    );
+                    $command = json_encode($r);
+                    break;
+                case 'ListUserPurchases':
+                    $r['ListUserPurchases'] = array(
+                        "{$userId}"
+                    );
+                    $command = json_encode($r);
+                    break;
+                //End Purchases
+                //CartAddition
+                case 'AddCartAddition':
+                    if ( is_array($this->value) ) {
+                        $itemId = $this->value['itemId'];
+                    } else {
+                        break;
+                    }
+                    $r['AddCartAddition'] = array(
+                        "{$userId}",
+                        "carrera-{$itemId}"
+                    );
+                    $command = json_encode($r);
+                    break;
+                case 'DeleteCartAddition':
+                    if ( is_array($this->value) ) {
+                        $itemId = $this->value['itemId'];
+                    } else {
+                        break;
+                    }
+                    $r['DeleteCartAddition'] = array(
+                        "{$userId}",
+                        "carrera-{$itemId}"
+                    );
+                    $command = json_encode($r);
+                    break;
+                case 'ListItemCartAdditions':
+                    if ( is_array($this->value) ) {
+                        $itemId = $this->value['itemId'];
+                    } else {
+                        break;
+                    }
+                    $r['ListItemCartAdditions'] = array(
+                        "carrera-{$itemId}"
+                    );
+                    $command = json_encode($r);
+                    break;
+                case 'ListUserCartAdditions':
+                    $r['ListUserCartAdditions'] = array(
+                        "{$userId}"
+                    );
+                    $command = json_encode($r);
+                    break;
+                //End CartAddition
+                default:
+                    return;
+            }
+            
+            if (isset($command)) {
+                $this->exists = true;
+                $this->command = $command;
+            }
+        }
+
+        $table = ActionBatch::table;
+        if (empty($this->id) || !$this->exists()) {
+            $statement = wire('database')->prepare("INSERT INTO $table (user_id, status, command, created) VALUES (?,?,?,?)");
+            $statement->execute(array($this->user->id, 'new', $this->command, $timestamp ));
+            $this->id = wire('database')->lastInsertId();
+            $this->exists = true;
+            return true;
+        }
+
+        $statement = wire('database')->prepare("UPDATE $table SET status = ?, submitted = ?, ended = ?, response = ? WHERE id = $this->id");
+        $statement->execute(array($this->status, $this->submitted, $this->ended, $this->response ));
+        return true;
+    }
+
+    public function fetch() {
+        $table = ActionBatch::table;
+
+        $statement = wire('database')->prepare("SELECT id, status, command, submitted, ended, created, response FROM $table WHERE id = ? LIMIT 1");
+
+        if (!$statement->execute(array($this->id))) return null;
+
+        while (($set = $statement->fetch(PDO::FETCH_ASSOC)) !== false) {
+            $result_set = array(
+                'id' => $set['id'],
+                'status' => $set['status'],
+                'command' => $set['command'],                
+                'submitted' => $set['submitted'],
+                'ended' => $set['ended'],
+                'created' => $set['created'],
+                'response' => $set['response']
+            );
+
+            break;
+        }
+
+        if (isset($result_set)) {
+            foreach ($result_set as $k => $v) {
+                $this->$k = $v;
+            }
+        } else {
+            $this->exists = false;
+        }
+    }
+
+    public function toArray() {
+        return array(
+            'id' => $this->id,
+            'user' => $this->user->id,
+            'command' => $this->command,
+            'status' => $this->status,
+            'response' => $this->response
+        );
+    }
+}
